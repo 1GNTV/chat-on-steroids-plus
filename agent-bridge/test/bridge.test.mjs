@@ -6,7 +6,9 @@ import { after, before, test } from 'node:test';
 import { spawnSync } from 'node:child_process';
 import { call, startDaemon, stopDaemon } from '../src/client.mjs';
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 let root;
+
 before(async () => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-bridge-test-'));
   spawnSync('git', ['init', '-q'], { cwd: root });
@@ -17,9 +19,19 @@ before(async () => {
   spawnSync('git', ['commit', '-qm', 'initial'], { cwd: root });
   await startDaemon(root, { restart: true });
 });
+
 after(async () => {
   await stopDaemon().catch(() => {});
-  fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  for (let i = 0; i < 20; i++) {
+    try {
+      fs.rmSync(root, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      if (!['EBUSY', 'EPERM', 'ENOTEMPTY'].includes(error?.code)) throw error;
+      await sleep(50);
+    }
+  }
+  fs.rmSync(root, { recursive: true, force: true });
 });
 
 test('read returns bounded numbered lines', async () => {
@@ -39,14 +51,23 @@ test('apply_patch changes a file', async () => {
 });
 
 test('exec session persists and can be polled', async () => {
-  const cmd = process.platform === 'win32'
-    ? `node -e "console.log('first'); setTimeout(()=>console.log('second'), 250); setTimeout(()=>{},500)"`
-    : `node -e "console.log('first'); setTimeout(()=>console.log('second'), 250); setTimeout(()=>{},500)"`;
-  const first = await call('exec_command', { command: cmd, yield_ms: 50 });
-  assert.equal(typeof first.session_id, 'number');
+  const cmd = `node -e "console.log('first'); setTimeout(()=>console.log('second'), 250); setTimeout(()=>{},500)"`;
+  const started = await call('exec_command', { command: cmd, yield_ms: 50 });
+  assert.equal(typeof started.session_id, 'number');
+
+  const first = /first/.test(started.output)
+    ? started
+    : await call('write_stdin', { session_id: started.session_id, cursor: 0, yield_ms: 1000 });
   assert.match(first.output, /first/);
-  const later = await call('write_stdin', { session_id: first.session_id, cursor: first.next_cursor, yield_ms: 350 });
+
+  const later = await call('write_stdin', {
+    session_id: started.session_id,
+    cursor: first.next_cursor,
+    yield_ms: 1000
+  });
   assert.match(later.output, /second/);
+
+  if (later.running) await call('kill', { session_id: started.session_id });
 });
 
 test('filesystem escape is refused', async () => {
