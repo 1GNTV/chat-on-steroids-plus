@@ -34,15 +34,15 @@ else
   git clone --depth 1 "$REPO_URL" "$INSTALL_DIR"
 fi
 
-echo "[cos-plus] Installing Agent Bridge"
+echo "[cos-plus] Installing the lightweight host CLI"
 npm install --global "$INSTALL_DIR/agent-bridge"
 
-agent-bridge --help >/dev/null
+cos-plus --help >/dev/null
 
 echo ""
-echo "Installed successfully."
-echo "Start it inside a project with:"
-echo "  agent-bridge start --root ."
+echo "COS+ installed successfully."
 echo ""
-echo "Then inspect available actions with:"
-echo "  agent-bridge capabilities"
+echo "Open your project and run:"
+echo "  cos-plus start ."
+echo ""
+echo "COS+ will print one command to paste into ChatGPT."

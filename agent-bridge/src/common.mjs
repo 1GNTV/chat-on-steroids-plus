@@ -3,40 +3,51 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-export const VERSION = '0.1.0';
+export const VERSION = '0.2.0';
 export const MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
 export const MAX_READ_BYTES = 512 * 1024;
 export const MAX_PROCESS_BUFFER = 2 * 1024 * 1024;
 export const STATE_DIR = path.join(os.homedir(), '.agent-bridge');
 export const STATE_FILE = path.join(STATE_DIR, 'state.json');
+export const SHARE_FILE = path.join(STATE_DIR, 'share.json');
 export const DAEMON_LOG = path.join(STATE_DIR, 'daemon.log');
+export const TUNNEL_LOG = path.join(STATE_DIR, 'tunnel.log');
+export const BIN_DIR = path.join(STATE_DIR, 'bin');
 
 export function ensureStateDir() {
   fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(BIN_DIR, { recursive: true, mode: 0o700 });
 }
 
 export function randomToken() {
   return crypto.randomBytes(32).toString('hex');
 }
 
-export function readState() {
+function readJson(file) {
   try {
-    return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
   } catch {
     return null;
   }
 }
 
-export function writeState(state) {
+function writeJson(file, value) {
   ensureStateDir();
-  const tmp = `${STATE_FILE}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
-  fs.renameSync(tmp, STATE_FILE);
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(value, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, file);
 }
 
-export function removeState() {
-  try { fs.unlinkSync(STATE_FILE); } catch {}
+function removeFile(file) {
+  try { fs.unlinkSync(file); } catch {}
 }
+
+export function readState() { return readJson(STATE_FILE); }
+export function writeState(state) { writeJson(STATE_FILE, state); }
+export function removeState() { removeFile(STATE_FILE); }
+export function readShareState() { return readJson(SHARE_FILE); }
+export function writeShareState(state) { writeJson(SHARE_FILE, state); }
+export function removeShareState() { removeFile(SHARE_FILE); }
 
 export function canonicalRoot(input) {
   const resolved = fs.realpathSync(path.resolve(input));
@@ -83,6 +94,11 @@ export function clampInt(value, min, max, fallback) {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
   return Math.max(min, Math.min(max, Math.trunc(n)));
+}
+
+export function encodeConnection({ url, token }) {
+  const payload = Buffer.from(JSON.stringify({ v: 1, url, token }), 'utf8').toString('base64url');
+  return `cosplus://v1/${payload}`;
 }
 
 export function json(value) {

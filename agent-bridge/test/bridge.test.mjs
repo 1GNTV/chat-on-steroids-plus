@@ -5,6 +5,8 @@ import path from 'node:path';
 import { after, before, test } from 'node:test';
 import { spawnSync } from 'node:child_process';
 import { call, startDaemon, stopDaemon } from '../src/client.mjs';
+import { encodeConnection, readState } from '../src/common.mjs';
+import { parseQuickTunnelUrl } from '../src/share.mjs';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 let root;
@@ -52,24 +54,54 @@ test('apply_patch changes a file', async () => {
 
 test('exec session persists and can be polled', async () => {
   const cmd = `node -e "console.log('first'); setTimeout(()=>console.log('second'), 250); setTimeout(()=>{},500)"`;
-  const started = await call('exec_command', { command: cmd, yield_ms: 50 });
+  const started = await call('exec_command', { command: cmd, yield_ms: 1000 });
   assert.equal(typeof started.session_id, 'number');
-
-  const first = /first/.test(started.output)
-    ? started
-    : await call('write_stdin', { session_id: started.session_id, cursor: 0, yield_ms: 1000 });
-  assert.match(first.output, /first/);
+  assert.match(started.output, /first/);
 
   const later = await call('write_stdin', {
     session_id: started.session_id,
-    cursor: first.next_cursor,
+    cursor: started.next_cursor,
     yield_ms: 1000
   });
   assert.match(later.output, /second/);
-
   if (later.running) await call('kill', { session_id: started.session_id });
 });
 
 test('filesystem escape is refused', async () => {
   await assert.rejects(() => call('read', { path: '..' }), /escapes workspace root|Not found/);
+});
+
+test('remote HTTP surface authenticates and hides absolute root', async () => {
+  const state = readState();
+  const endpoint = `http://127.0.0.1:${state.http_port}/v1/call`;
+  const unauthorized = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ action: 'capabilities', args: {} })
+  });
+  assert.equal(unauthorized.status, 401);
+
+  const authorized = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: `Bearer ${state.share_token}`
+    },
+    body: JSON.stringify({ action: 'capabilities', args: {} })
+  });
+  const body = await authorized.json();
+  assert.equal(body.ok, true);
+  assert.equal(body.result.workspace, path.basename(root));
+  assert.equal('root' in body.result, false);
+});
+
+test('connection bundle is compact and does not expose token as plain query text', () => {
+  const bundle = encodeConnection({ url: 'https://tiny-example.trycloudflare.com', token: 'secret-value' });
+  assert.match(bundle, /^cosplus:\/\/v1\/[A-Za-z0-9_-]+$/);
+  assert.equal(bundle.includes('secret-value'), false);
+});
+
+test('Quick Tunnel URL parser finds Cloudflare URL', () => {
+  const line = 'INF Your quick Tunnel has been created! Visit it at https://kind-bird-7.trycloudflare.com';
+  assert.equal(parseQuickTunnelUrl(line), 'https://kind-bird-7.trycloudflare.com');
 });

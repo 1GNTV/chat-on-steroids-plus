@@ -2,15 +2,17 @@ name: Agent Bridge
 
 on:
   push:
-    branches: [main, agent-bridge-cli]
+    branches: [main, remote-one-command]
     paths:
       - "agent-bridge/**"
+      - "remote-client/**"
       - "install.sh"
       - "install.ps1"
       - ".github/workflows/agent-bridge.yml"
   pull_request:
     paths:
       - "agent-bridge/**"
+      - "remote-client/**"
       - "install.sh"
       - "install.ps1"
       - ".github/workflows/agent-bridge.yml"
@@ -28,9 +30,19 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: ${{ matrix.node }}
-      - name: Test bridge
+      - name: Test host bridge
         working-directory: agent-bridge
         run: npm test
-      - name: Check package
+      - name: Check host package
         working-directory: agent-bridge
         run: npm pack --dry-run
+      - name: Test remote client
+        working-directory: remote-client
+        run: npm test
+      - name: Check remote client package
+        working-directory: remote-client
+        run: npm pack --dry-run
+      - name: Smoke install remote client from GitHub
+        run: |
+          npm install --global https://github.com/1GNTV/chat-on-steroids-plus/archive/refs/heads/cos-plus-client.tar.gz
+          cos-plus --help

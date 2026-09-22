@@ -1,7 +1,7 @@
 {
   "name": "chat-on-steroids-plus-bridge",
-  "version": "0.1.0",
-  "description": "Local CLI bridge for ChatGPT coding workflows: read, search, patch and persistent shell sessions without an MCP transport.",
+  "version": "0.2.0",
+  "description": "Local and remote CLI bridge for ChatGPT coding workflows with a one-command free Quick Tunnel.",
   "license": "MIT",
   "type": "module",
   "bin": {
