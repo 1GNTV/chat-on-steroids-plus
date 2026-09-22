@@ -1,20 +1,11 @@
-# Agent Bridge
+# COS+ Agent Bridge
 
-Agent Bridge is the lightweight local coding layer added by Chat On Steroids Plus.
-It exposes filesystem, patching and persistent terminal operations through a small
-JSON-friendly CLI, so a local agent that can run commands can use the same kind of
-primitives normally exposed by a coding MCP.
+Host-side bridge for Chat On Steroids Plus.
 
-## Commands
+```bash
+cos-plus start /path/to/project
+```
 
-- `read` - bounded file reads and directory listings
-- `find` - ripgrep when available, with a Node fallback
-- `apply-patch` - validate and apply unified git patches
-- `exec` - start a command in the persistent daemon
-- `write-stdin` - poll or write to an existing process
-- `processes` / `kill` - inspect and stop process sessions
+This starts the local coding daemon and a free Cloudflare Quick Tunnel, then prints the exact client command to give to ChatGPT.
 
-Filesystem operations are confined to the selected workspace root. Shell commands
-run with the permissions of your normal user account and are not an OS sandbox.
-
-Run `agent-bridge --help` after installation for the complete CLI.
+Use `cos-plus stop` to revoke the current remote connection. Use `agent-bridge start --root . --local` for loopback-only operation.

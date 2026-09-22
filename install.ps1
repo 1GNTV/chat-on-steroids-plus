@@ -30,20 +30,20 @@ if (Test-Path (Join-Path $InstallDir ".git")) {
     git clone --depth 1 $RepoUrl $InstallDir
 }
 
-Write-Host "[cos-plus] Installing Agent Bridge"
-$Npm = (Get-Command npm.cmd -ErrorAction SilentlyContinue)
+Write-Host "[cos-plus] Installing the lightweight host CLI"
+$Npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
 if ($Npm) {
     & $Npm.Source install --global (Join-Path $InstallDir "agent-bridge")
 } else {
     npm install --global (Join-Path $InstallDir "agent-bridge")
 }
 
-agent-bridge --help | Out-Null
+cos-plus --help | Out-Null
 
 Write-Host ""
-Write-Host "Installed successfully."
-Write-Host "Start it inside a project with:"
-Write-Host "  agent-bridge start --root ."
+Write-Host "COS+ installed successfully."
 Write-Host ""
-Write-Host "Then inspect available actions with:"
-Write-Host "  agent-bridge capabilities"
+Write-Host "Open your project and run:"
+Write-Host "  cos-plus start ."
+Write-Host ""
+Write-Host "COS+ will print one command to paste into ChatGPT."

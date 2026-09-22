@@ -1,5 +1,7 @@
 import fs from 'node:fs';
+import http from 'node:http';
 import net from 'node:net';
+import path from 'node:path';
 import { spawn } from 'node:child_process';
 import {
   MAX_MESSAGE_BYTES,
@@ -17,6 +19,7 @@ import { findOp, patchOp, readOp } from './ops.mjs';
 const rootArg = process.argv[2] ?? process.cwd();
 const root = canonicalRoot(rootArg);
 const token = process.env.AGENT_BRIDGE_TOKEN || randomToken();
+const shareToken = process.env.AGENT_BRIDGE_SHARE_TOKEN || randomToken();
 const processes = new Map();
 let nextSession = 1;
 let shuttingDown = false;
@@ -30,6 +33,12 @@ function appendBuffer(record, chunk, stream) {
     record.output = bytes.subarray(bytes.length - MAX_PROCESS_BUFFER).toString();
     record.truncated = true;
   }
+  notifyRecord(record);
+}
+
+function notifyRecord(record) {
+  for (const resolve of record.waiters) resolve();
+  record.waiters.clear();
 }
 
 function snapshot(record, from = 0) {
@@ -48,12 +57,20 @@ function snapshot(record, from = 0) {
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
-async function waitForActivity(record, cursor, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (record.output.length > cursor || !record.running) return;
-    await sleep(Math.min(20, Math.max(1, deadline - Date.now())));
-  }
+function waitForActivity(record, cursor, timeoutMs) {
+  if (!record.running || record.output.length > cursor || timeoutMs <= 0) return Promise.resolve();
+  return new Promise((resolve) => {
+    let timer;
+    const finish = () => {
+      record.waiters.delete(finish);
+      if (timer) clearTimeout(timer);
+      resolve();
+    };
+    record.waiters.add(finish);
+    timer = setTimeout(finish, timeoutMs);
+    timer.unref?.();
+    if (!record.running || record.output.length > cursor) finish();
+  });
 }
 
 function waitForExit(record, timeoutMs = 1500) {
@@ -95,7 +112,7 @@ async function execOp(args = {}) {
     env: { ...process.env, AGENT_BRIDGE_ROOT: root },
     stdio: ['pipe', 'pipe', 'pipe']
   });
-  const record = { id, child, cwd, output: '', events: [], running: true, exitCode: null, signal: null, truncated: false };
+  const record = { id, child, cwd, output: '', events: [], waiters: new Set(), running: true, exitCode: null, signal: null, truncated: false };
   processes.set(id, record);
   child.stdout.on('data', (d) => appendBuffer(record, d, 'stdout'));
   child.stderr.on('data', (d) => appendBuffer(record, d, 'stderr'));
@@ -104,10 +121,11 @@ async function execOp(args = {}) {
     record.running = false;
     record.exitCode = code;
     record.signal = signal;
+    notifyRecord(record);
   });
 
   const yieldMs = Math.max(0, Math.min(30_000, Number(args.yield_ms ?? 1000)));
-  if (yieldMs) await waitForActivity(record, 0, yieldMs);
+  await waitForActivity(record, 0, yieldMs);
   return snapshot(record, 0);
 }
 
@@ -123,7 +141,7 @@ async function writeStdinOp(args = {}) {
   }
 
   const yieldMs = Math.max(0, Math.min(30_000, Number(args.yield_ms ?? 250)));
-  if (yieldMs) await waitForActivity(record, cursor, yieldMs);
+  await waitForActivity(record, cursor, yieldMs);
   return snapshot(record, cursor);
 }
 
@@ -135,38 +153,90 @@ async function killOp(args = {}) {
   return { session_id: id, signalled: true, running: record.running };
 }
 
-async function shutdown() {
-  if (shuttingDown) return;
-  shuttingDown = true;
-  await Promise.all([...processes.values()].map((record) => terminate(record).catch(() => {})));
-  removeState();
-  await new Promise((resolve) => server.close(resolve));
-  process.exit(0);
-}
-
-async function dispatch(req) {
+async function dispatch(req, { remote = false } = {}) {
   switch (req.action) {
-    case 'ping': return { version: VERSION, pid: process.pid, root };
+    case 'ping': return remote
+      ? { version: VERSION, workspace: path.basename(root) }
+      : { version: VERSION, pid: process.pid, root };
     case 'capabilities': return {
       version: VERSION,
-      root,
-      actions: ['read', 'find', 'apply_patch', 'exec_command', 'write_stdin', 'kill', 'processes']
+      ...(remote ? { workspace: path.basename(root) } : { root }),
+      actions: ['read', 'find', 'apply_patch', 'exec_command', 'write_stdin', 'processes', 'kill']
     };
     case 'read': return readOp(root, req.args);
     case 'find': return findOp(root, req.args);
     case 'apply_patch': return patchOp(root, req.args);
     case 'exec_command': return execOp(req.args);
     case 'write_stdin': return writeStdinOp(req.args);
-    case 'kill': return killOp(req.args);
     case 'processes': return [...processes.values()].map((r) => snapshot(r, r.output.length));
+    case 'kill': return killOp(req.args);
     case 'shutdown':
-      setTimeout(() => { void shutdown(); }, 25);
+      if (remote) throw new Error('shutdown is local-only');
+      setTimeout(() => { void shutdown(); }, 25).unref?.();
       return { shutting_down: true };
     default: throw new Error(`Unknown action: ${req.action}`);
   }
 }
 
-const server = net.createServer((socket) => {
+function sendJson(res, status, value) {
+  const body = JSON.stringify(value);
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(body),
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff'
+  });
+  res.end(body);
+}
+
+function authorized(req) {
+  const header = req.headers.authorization || '';
+  return header === `Bearer ${shareToken}`;
+}
+
+const httpServer = http.createServer((req, res) => {
+  if (!authorized(req)) {
+    sendJson(res, 401, { ok: false, error: 'Unauthorized' });
+    return;
+  }
+  if (req.method === 'GET' && req.url === '/v1/health') {
+    sendJson(res, 200, { ok: true, result: { version: VERSION, workspace: path.basename(root) } });
+    return;
+  }
+  if (req.method !== 'POST' || req.url !== '/v1/call') {
+    sendJson(res, 404, { ok: false, error: 'Not found' });
+    return;
+  }
+
+  let size = 0;
+  const chunks = [];
+  req.on('data', (chunk) => {
+    size += chunk.length;
+    if (size > MAX_MESSAGE_BYTES) {
+      req.destroy(new Error('Request too large'));
+      return;
+    }
+    chunks.push(chunk);
+  });
+  req.on('end', async () => {
+    if (size > MAX_MESSAGE_BYTES) {
+      if (!res.headersSent) sendJson(res, 413, { ok: false, error: 'Request too large' });
+      return;
+    }
+    try {
+      const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      const result = await dispatch(payload, { remote: true });
+      sendJson(res, 200, { ok: true, result });
+    } catch (error) {
+      sendJson(res, 400, { ok: false, error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+  req.on('error', () => {
+    if (!res.headersSent) sendJson(res, 400, { ok: false, error: 'Invalid request' });
+  });
+});
+
+const localServer = net.createServer((socket) => {
   socket.setEncoding('utf8');
   let buffer = '';
   socket.on('data', async (chunk) => {
@@ -190,10 +260,41 @@ const server = net.createServer((socket) => {
   });
 });
 
-server.listen(0, '127.0.0.1', () => {
+async function listen(server) {
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      server.off('error', reject);
+      resolve();
+    });
+  });
   const address = server.address();
-  if (!address || typeof address === 'string') throw new Error('Failed to bind daemon');
-  writeState({ version: VERSION, pid: process.pid, port: address.port, token, root, started_at: new Date().toISOString() });
+  if (!address || typeof address === 'string') throw new Error('Failed to bind local server');
+  return address.port;
+}
+
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  await Promise.all([...processes.values()].map((record) => terminate(record).catch(() => {})));
+  removeState();
+  await Promise.all([
+    new Promise((resolve) => localServer.close(resolve)),
+    new Promise((resolve) => httpServer.close(resolve))
+  ]);
+  process.exit(0);
+}
+
+const [port, httpPort] = await Promise.all([listen(localServer), listen(httpServer)]);
+writeState({
+  version: VERSION,
+  pid: process.pid,
+  port,
+  http_port: httpPort,
+  token,
+  share_token: shareToken,
+  root,
+  started_at: new Date().toISOString()
 });
 
 process.on('SIGINT', () => { void shutdown(); });

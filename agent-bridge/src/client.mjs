@@ -34,13 +34,23 @@ export async function ping(state) {
   } catch { return false; }
 }
 
+async function waitUntilStopped(state, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!(await ping(state))) return true;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return !(await ping(state));
+}
+
 export async function startDaemon(rootInput = process.cwd(), { restart = false } = {}) {
   const root = canonicalRoot(rootInput);
   const existing = readState();
   if (existing && await ping(existing)) {
-    if (existing.root === root && !restart) return existing;
+    const compatible = existing.root === root && existing.http_port && existing.share_token;
+    if (compatible && !restart) return existing;
     try { await requestRaw(existing, { action: 'shutdown', args: {} }, 1500); } catch {}
-    await new Promise((r) => setTimeout(r, 150));
+    await waitUntilStopped(existing, 3000);
   }
   removeState();
   ensureStateDir();
@@ -56,14 +66,14 @@ export async function startDaemon(rootInput = process.cwd(), { restart = false }
   for (let i = 0; i < 50; i++) {
     await new Promise((r) => setTimeout(r, 100));
     const state = readState();
-    if (state && state.pid === child.pid && await ping(state)) return state;
+    if (state && state.pid === child.pid && state.http_port && state.share_token && await ping(state)) return state;
   }
   throw new Error(`Daemon did not start. See ${DAEMON_LOG}`);
 }
 
 export async function ensureDaemon(root = null) {
   const state = readState();
-  if (state && await ping(state)) {
+  if (state && state.http_port && state.share_token && await ping(state)) {
     if (root === null || canonicalRoot(root) === state.root) return state;
   }
   return startDaemon(root ?? process.cwd());
@@ -81,11 +91,7 @@ export async function stopDaemon() {
   if (!state) return { stopped: false, reason: 'not_running' };
   if (!(await ping(state))) { removeState(); return { stopped: false, reason: 'stale_state' }; }
   const res = await requestRaw(state, { action: 'shutdown', args: {} }, 1500);
-  for (let i = 0; i < 40; i++) {
-    if (!(await ping(state))) break;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  if (await ping(state)) throw new Error('Daemon did not stop cleanly');
+  if (!(await waitUntilStopped(state, 3000))) throw new Error('Daemon did not stop cleanly');
   removeState();
   return { stopped: true, result: res.result };
 }
