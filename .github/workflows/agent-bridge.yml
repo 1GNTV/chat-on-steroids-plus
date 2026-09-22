@@ -42,3 +42,7 @@ jobs:
       - name: Check remote client package
         working-directory: remote-client
         run: npm pack --dry-run
+      - name: Smoke install remote client from GitHub
+        run: |
+          npm install --global https://github.com/1GNTV/chat-on-steroids-plus/archive/refs/heads/cos-plus-client.tar.gz
+          cos-plus --help
