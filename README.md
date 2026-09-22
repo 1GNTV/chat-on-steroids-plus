@@ -106,6 +106,41 @@ Both local servers bind only to `127.0.0.1`. `cloudflared` makes the outbound tu
 
 Quick Tunnels are an official Cloudflare development/testing feature and do not require a Cloudflare account. They are temporary and have no uptime SLA, so the public URL can change when COS+ is restarted.
 
+
+## MCP-like protocol mode
+
+COS+ V3 keeps the simple commands, but also exposes an MCP-like protocol surface so an agent can discover tools instead of relying on hard-coded CLI knowledge.
+
+```bash
+cos-plus initialize
+cos-plus tools
+cos-plus call-tool read '{"path":"package.json"}'
+```
+
+The tool registry contains names, descriptions, JSON Schemas and annotations. Calls return typed `content`, `structuredContent`, `isError` and stable error codes.
+
+Resources are discoverable too:
+
+```bash
+cos-plus resources
+cos-plus read-resource resource://workspace/tree
+cos-plus read-resource resource://git/status
+cos-plus read-resource resource://git/diff
+cos-plus read-resource resource://project/metadata
+```
+
+Persistent command sessions also appear as tasks:
+
+```bash
+cos-plus tasks
+cos-plus task process:1 --yield-ms 1000
+cos-plus cancel process:1
+```
+
+For a protocol-oriented agent, `cos-plus agent` exposes newline-delimited JSON-RPC 2.0 over stdin/stdout. Supported methods are `initialize`, `tools/list`, `tools/call`, `resources/list`, `resources/read`, `tasks/list`, `tasks/get`, `tasks/cancel`, and `ping`.
+
+This is intentionally **MCP-like rather than a native MCP transport**: the agent still reaches COS+ through the tiny CLI + HTTPS tunnel, but discovery, schemas, invocation, typed results, resources and task lifecycle now follow the same style of interaction.
+
 ## Security
 
 The connection string printed by `cos-plus start` is a **secret capability**. Anyone who has it while the host is running can use the exposed tools. Do not post it publicly.

@@ -15,6 +15,17 @@ import {
   removeState
 } from './common.mjs';
 import { findOp, patchOp, readOp } from './ops.mjs';
+import {
+  PROTOCOL_VERSION,
+  TOOL_DEFINITIONS,
+  validateToolArguments,
+  toolSuccess,
+  toolFailure,
+  taskFromSnapshot,
+  parseTaskId,
+  protocolError
+} from './protocol.mjs';
+import { listResources, readResource } from './resources.mjs';
 
 const rootArg = process.argv[2] ?? process.cwd();
 const root = canonicalRoot(rootArg);
@@ -44,6 +55,7 @@ function notifyRecord(record) {
 function snapshot(record, from = 0) {
   return {
     session_id: record.id,
+    task_id: `process:${record.id}`,
     running: record.running,
     exit_code: record.exitCode,
     signal: record.signal,
@@ -53,6 +65,10 @@ function snapshot(record, from = 0) {
     next_cursor: record.output.length,
     truncated: record.truncated
   };
+}
+
+function processSnapshots() {
+  return [...processes.values()].map((record) => snapshot(record, record.output.length));
 }
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
@@ -93,21 +109,27 @@ async function terminate(record, signal = 'SIGTERM') {
       killer.once('close', resolve);
     });
   } else {
-    try { record.child.kill(signal); } catch {}
+    try {
+      if (record.child.pid) process.kill(-record.child.pid, signal);
+      else record.child.kill(signal);
+    } catch {
+      try { record.child.kill(signal); } catch {}
+    }
   }
-  await waitForExit(record);
+  await waitForExit(record, 2500);
 }
 
 async function execOp(args = {}) {
   const command = String(args.command ?? '');
-  if (!command) throw new Error('command is required');
+  if (!command) throw protocolError('INVALID_ARGUMENT', 'command is required');
   const cwd = resolveWithin(root, args.cwd ?? '.');
-  if (!fs.statSync(cwd).isDirectory()) throw new Error('cwd must be a directory');
+  if (!fs.statSync(cwd).isDirectory()) throw protocolError('INVALID_ARGUMENT', 'cwd must be a directory');
 
   const id = nextSession++;
   const child = spawn(command, {
     cwd,
     shell: true,
+    detached: process.platform !== 'win32',
     windowsHide: true,
     env: { ...process.env, AGENT_BRIDGE_ROOT: root },
     stdio: ['pipe', 'pipe', 'pipe']
@@ -132,11 +154,11 @@ async function execOp(args = {}) {
 async function writeStdinOp(args = {}) {
   const id = Number(args.session_id);
   const record = processes.get(id);
-  if (!record) throw new Error(`Unknown session_id: ${args.session_id}`);
+  if (!record) throw protocolError('TASK_NOT_FOUND', `Unknown session_id: ${args.session_id}`);
   const cursor = Math.max(0, Math.min(record.output.length, Number(args.cursor ?? 0)));
 
   if (args.chars !== undefined) {
-    if (!record.running) throw new Error('Process has already exited');
+    if (!record.running) throw protocolError('TASK_COMPLETED', 'Process has already exited');
     record.child.stdin.write(String(args.chars));
   }
 
@@ -148,33 +170,99 @@ async function writeStdinOp(args = {}) {
 async function killOp(args = {}) {
   const id = Number(args.session_id);
   const record = processes.get(id);
-  if (!record) throw new Error(`Unknown session_id: ${args.session_id}`);
+  if (!record) throw protocolError('TASK_NOT_FOUND', `Unknown session_id: ${args.session_id}`);
   await terminate(record, args.signal || 'SIGTERM');
-  return { session_id: id, signalled: true, running: record.running };
+  return { session_id: id, task_id: `process:${id}`, signalled: true, running: record.running };
+}
+
+async function callPrimitive(name, args = {}) {
+  switch (name) {
+    case 'read': return readOp(root, args);
+    case 'find': return findOp(root, args);
+    case 'apply_patch': return patchOp(root, args);
+    case 'exec_command': return execOp(args);
+    case 'write_stdin': return writeStdinOp(args);
+    case 'processes': return processSnapshots();
+    case 'kill': return killOp(args);
+    default: throw protocolError('TOOL_NOT_FOUND', `Unknown tool: ${name}`);
+  }
+}
+
+function initialize(remote) {
+  return {
+    protocolVersion: PROTOCOL_VERSION,
+    serverInfo: { name: 'COS+ Agent Bridge', version: VERSION },
+    capabilities: {
+      tools: { listChanged: false },
+      resources: { subscribe: false, listChanged: false },
+      tasks: { list: true, get: true, cancel: true, progress: true }
+    },
+    workspace: { name: path.basename(root), ...(remote ? {} : { root }) },
+    transport: remote ? 'https' : 'local'
+  };
+}
+
+async function toolCall(args = {}) {
+  const name = String(args.name ?? '');
+  const input = args.arguments ?? {};
+  try {
+    validateToolArguments(name, input);
+    return toolSuccess(name, await callPrimitive(name, input));
+  } catch (error) {
+    return toolFailure(name || 'unknown', error);
+  }
+}
+
+async function taskGet(args = {}) {
+  const sessionId = parseTaskId(args.task_id);
+  const record = processes.get(sessionId);
+  if (!record) throw protocolError('TASK_NOT_FOUND', `Unknown task: ${args.task_id}`);
+  const cursor = Math.max(0, Math.min(record.output.length, Number(args.cursor ?? record.output.length)));
+  const yieldMs = Math.max(0, Math.min(30_000, Number(args.yield_ms ?? 0)));
+  await waitForActivity(record, cursor, yieldMs);
+  return taskFromSnapshot(snapshot(record, cursor));
+}
+
+async function taskCancel(args = {}) {
+  const sessionId = parseTaskId(args.task_id);
+  const record = processes.get(sessionId);
+  if (!record) throw protocolError('TASK_NOT_FOUND', `Unknown task: ${args.task_id}`);
+  await terminate(record, args.signal || 'SIGTERM');
+  return taskFromSnapshot(snapshot(record, record.output.length));
 }
 
 async function dispatch(req, { remote = false } = {}) {
   switch (req.action) {
     case 'ping': return remote
-      ? { version: VERSION, workspace: path.basename(root) }
-      : { version: VERSION, pid: process.pid, root };
+      ? { version: VERSION, protocolVersion: PROTOCOL_VERSION, workspace: path.basename(root) }
+      : { version: VERSION, protocolVersion: PROTOCOL_VERSION, pid: process.pid, root };
+    case 'initialize': return initialize(remote);
     case 'capabilities': return {
       version: VERSION,
+      protocolVersion: PROTOCOL_VERSION,
       ...(remote ? { workspace: path.basename(root) } : { root }),
-      actions: ['read', 'find', 'apply_patch', 'exec_command', 'write_stdin', 'processes', 'kill']
+      actions: TOOL_DEFINITIONS.map((tool) => tool.name),
+      protocolActions: ['initialize', 'tools_list', 'tools_call', 'resources_list', 'resources_read', 'tasks_list', 'tasks_get', 'tasks_cancel']
     };
-    case 'read': return readOp(root, req.args);
-    case 'find': return findOp(root, req.args);
-    case 'apply_patch': return patchOp(root, req.args);
-    case 'exec_command': return execOp(req.args);
-    case 'write_stdin': return writeStdinOp(req.args);
-    case 'processes': return [...processes.values()].map((r) => snapshot(r, r.output.length));
-    case 'kill': return killOp(req.args);
+    case 'tools_list': return { tools: TOOL_DEFINITIONS };
+    case 'tools_call': return toolCall(req.args);
+    case 'resources_list': return listResources();
+    case 'resources_read': return readResource(root, req.args?.uri, { processSnapshots });
+    case 'tasks_list': return { tasks: processSnapshots().map(taskFromSnapshot) };
+    case 'tasks_get': return taskGet(req.args);
+    case 'tasks_cancel': return taskCancel(req.args);
+    case 'read':
+    case 'find':
+    case 'apply_patch':
+    case 'exec_command':
+    case 'write_stdin':
+    case 'processes':
+    case 'kill': return callPrimitive(req.action, req.args);
     case 'shutdown':
-      if (remote) throw new Error('shutdown is local-only');
+      if (remote) throw protocolError('PERMISSION_DENIED', 'shutdown is local-only');
       setTimeout(() => { void shutdown(); }, 25).unref?.();
       return { shutting_down: true };
-    default: throw new Error(`Unknown action: ${req.action}`);
+    default: throw protocolError('METHOD_NOT_FOUND', `Unknown action: ${req.action}`);
   }
 }
 
@@ -196,15 +284,15 @@ function authorized(req) {
 
 const httpServer = http.createServer((req, res) => {
   if (!authorized(req)) {
-    sendJson(res, 401, { ok: false, error: 'Unauthorized' });
+    sendJson(res, 401, { ok: false, error: { code: 'UNAUTHORIZED', message: 'Unauthorized' } });
     return;
   }
   if (req.method === 'GET' && req.url === '/v1/health') {
-    sendJson(res, 200, { ok: true, result: { version: VERSION, workspace: path.basename(root) } });
+    sendJson(res, 200, { ok: true, result: { version: VERSION, protocolVersion: PROTOCOL_VERSION, workspace: path.basename(root) } });
     return;
   }
   if (req.method !== 'POST' || req.url !== '/v1/call') {
-    sendJson(res, 404, { ok: false, error: 'Not found' });
+    sendJson(res, 404, { ok: false, error: { code: 'NOT_FOUND', message: 'Not found' } });
     return;
   }
 
@@ -220,7 +308,7 @@ const httpServer = http.createServer((req, res) => {
   });
   req.on('end', async () => {
     if (size > MAX_MESSAGE_BYTES) {
-      if (!res.headersSent) sendJson(res, 413, { ok: false, error: 'Request too large' });
+      if (!res.headersSent) sendJson(res, 413, { ok: false, error: { code: 'REQUEST_TOO_LARGE', message: 'Request too large' } });
       return;
     }
     try {
@@ -228,11 +316,11 @@ const httpServer = http.createServer((req, res) => {
       const result = await dispatch(payload, { remote: true });
       sendJson(res, 200, { ok: true, result });
     } catch (error) {
-      sendJson(res, 400, { ok: false, error: error instanceof Error ? error.message : String(error) });
+      sendJson(res, 400, { ok: false, error: { code: error?.code || 'PROTOCOL_ERROR', message: error instanceof Error ? error.message : String(error), ...(error?.data !== undefined ? { data: error.data } : {}) } });
     }
   });
   req.on('error', () => {
-    if (!res.headersSent) sendJson(res, 400, { ok: false, error: 'Invalid request' });
+    if (!res.headersSent) sendJson(res, 400, { ok: false, error: { code: 'INVALID_REQUEST', message: 'Invalid request' } });
   });
 });
 
@@ -242,7 +330,7 @@ const localServer = net.createServer((socket) => {
   socket.on('data', async (chunk) => {
     buffer += chunk;
     if (Buffer.byteLength(buffer) > MAX_MESSAGE_BYTES) {
-      socket.end(JSON.stringify({ ok: false, error: 'Request too large' }) + '\n');
+      socket.end(JSON.stringify({ ok: false, error: { code: 'REQUEST_TOO_LARGE', message: 'Request too large' } }) + '\n');
       return;
     }
     const idx = buffer.indexOf('\n');
@@ -251,11 +339,11 @@ const localServer = net.createServer((socket) => {
     buffer = '';
     try {
       const req = JSON.parse(line);
-      if (req.token !== token) throw new Error('Unauthorized');
+      if (req.token !== token) throw protocolError('UNAUTHORIZED', 'Unauthorized');
       const result = await dispatch(req);
       socket.end(JSON.stringify({ ok: true, result }) + '\n');
     } catch (error) {
-      socket.end(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }) + '\n');
+      socket.end(JSON.stringify({ ok: false, error: { code: error?.code || 'PROTOCOL_ERROR', message: error instanceof Error ? error.message : String(error) } }) + '\n');
     }
   });
 });
@@ -288,6 +376,7 @@ async function shutdown() {
 const [port, httpPort] = await Promise.all([listen(localServer), listen(httpServer)]);
 writeState({
   version: VERSION,
+  protocol_version: PROTOCOL_VERSION,
   pid: process.pid,
   port,
   http_port: httpPort,

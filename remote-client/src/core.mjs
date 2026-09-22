@@ -33,7 +33,13 @@ export async function remoteCall(config, action, args = {}, timeoutMs = 35_000) 
     let payload;
     try { payload = await response.json(); }
     catch { throw new Error(`COS+ host returned HTTP ${response.status}`); }
-    if (!response.ok || !payload?.ok) throw new Error(payload?.error || `COS+ host returned HTTP ${response.status}`);
+    if (!response.ok || !payload?.ok) {
+      const remote = payload?.error;
+      const error = new Error(typeof remote === 'string' ? remote : remote?.message || `COS+ host returned HTTP ${response.status}`);
+      if (remote?.code) error.code = remote.code;
+      if (remote?.data !== undefined) error.data = remote.data;
+      throw error;
+    }
     return payload.result;
   } finally {
     clearTimeout(timer);

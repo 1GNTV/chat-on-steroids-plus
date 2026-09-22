@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { decodeConnection, remoteCall } from '../src/core.mjs';
+import { runAgent } from '../src/agent.mjs';
 
 const STATE_DIR = path.join(os.homedir(), '.cos-plus-client');
 const CONFIG_FILE = path.join(STATE_DIR, 'config.json');
@@ -45,8 +46,13 @@ async function readStdin() {
   return Buffer.concat(chunks).toString('utf8');
 }
 
+function parseJsonArgument(positionals, fallback = {}) {
+  const raw = positionals.join(' ').trim();
+  return raw ? JSON.parse(raw) : fallback;
+}
+
 function help() {
-  return `cos-plus - remote COS+ coding client\n\nSetup:\n  cos-plus connect CONNECTION\n  cos-plus status\n  cos-plus disconnect\n\nTools:\n  cos-plus capabilities\n  cos-plus read PATH [--start-line N] [--end-line N] [--max-bytes N]\n  cos-plus find QUERY [PATH] [--limit N]\n  cos-plus apply-patch [--file PATCH]\n  cos-plus exec "COMMAND..." [--cmd STRING] [--cwd PATH] [--yield-ms N]\n  cos-plus write-stdin SESSION_ID [--chars TEXT] [--yield-ms N] [--cursor N]\n  cos-plus processes\n  cos-plus kill SESSION_ID [--signal SIGTERM]\n  cos-plus call '<json>'`;
+  return `cos-plus - remote COS+ agent client\n\nSetup:\n  cos-plus connect CONNECTION\n  cos-plus initialize\n  cos-plus status\n  cos-plus disconnect\n\nMCP-like protocol:\n  cos-plus tools\n  cos-plus call-tool NAME '{"arg":"value"}'\n  cos-plus resources\n  cos-plus read-resource URI\n  cos-plus tasks\n  cos-plus task TASK_ID [--cursor N] [--yield-ms N]\n  cos-plus cancel TASK_ID [--signal SIGTERM]\n  cos-plus agent                 newline-delimited JSON-RPC over stdin/stdout\n\nLegacy convenience commands:\n  cos-plus capabilities\n  cos-plus read PATH [--start-line N] [--end-line N] [--max-bytes N]\n  cos-plus find QUERY [PATH] [--limit N]\n  cos-plus apply-patch [--file PATCH]\n  cos-plus exec "COMMAND..." [--cmd STRING] [--cwd PATH] [--yield-ms N]\n  cos-plus write-stdin SESSION_ID [--chars TEXT] [--yield-ms N] [--cursor N]\n  cos-plus processes\n  cos-plus kill SESSION_ID [--signal SIGTERM]\n  cos-plus call '<json>'`;
 }
 
 async function main() {
@@ -56,19 +62,40 @@ async function main() {
 
   if (cmd === 'connect') {
     const config = decodeConnection(positionals[0]);
-    const caps = await remoteCall(config, 'capabilities', {});
+    const init = await remoteCall(config, 'initialize', {});
+    const tools = await remoteCall(config, 'tools_list', {});
     writeConfig(config);
-    process.stdout.write(`COS+ connected to workspace: ${caps.workspace || 'workspace'}\n`);
-    process.stdout.write(`Available tools: ${caps.actions.join(', ')}\n`);
-    process.stdout.write('Use the cos-plus commands shown by `cos-plus help` for all project file and terminal work.\n');
+    process.stdout.write(`COS+ connected to workspace: ${init.workspace?.name || 'workspace'}\n`);
+    process.stdout.write(`Protocol: ${init.protocolVersion}\n`);
+    process.stdout.write(`Available tools: ${tools.tools.map((tool) => tool.name).join(', ')}\n`);
+    process.stdout.write('Start with `cos-plus initialize` and `cos-plus tools`, or run `cos-plus agent` for JSON-RPC mode.\n');
     return;
   }
   if (cmd === 'disconnect') { removeConfig(); process.stdout.write('COS+ disconnected locally.\n'); return; }
 
   const config = readConfig();
+  if (cmd === 'agent') { await runAgent(config); return; }
+  if (cmd === 'initialize') { json({ ok: true, result: await remoteCall(config, 'initialize', {}) }); return; }
   if (cmd === 'status') {
-    const caps = await remoteCall(config, 'capabilities', {});
-    json({ ok: true, result: { connected: true, workspace: caps.workspace, actions: caps.actions } });
+    const init = await remoteCall(config, 'initialize', {});
+    json({ ok: true, result: { connected: true, protocolVersion: init.protocolVersion, workspace: init.workspace?.name, capabilities: init.capabilities } });
+    return;
+  }
+  if (cmd === 'tools') { json({ ok: true, result: await remoteCall(config, 'tools_list', {}) }); return; }
+  if (cmd === 'call-tool') {
+    const name = positionals.shift();
+    json({ ok: true, result: await remoteCall(config, 'tools_call', { name, arguments: parseJsonArgument(positionals, {}) }) });
+    return;
+  }
+  if (cmd === 'resources') { json({ ok: true, result: await remoteCall(config, 'resources_list', {}) }); return; }
+  if (cmd === 'read-resource') { json({ ok: true, result: await remoteCall(config, 'resources_read', { uri: positionals[0] }) }); return; }
+  if (cmd === 'tasks') { json({ ok: true, result: await remoteCall(config, 'tasks_list', {}) }); return; }
+  if (cmd === 'task') {
+    json({ ok: true, result: await remoteCall(config, 'tasks_get', { task_id: positionals[0], cursor: num(flags.cursor), yield_ms: num(flags['yield-ms']) }) });
+    return;
+  }
+  if (cmd === 'cancel') {
+    json({ ok: true, result: await remoteCall(config, 'tasks_cancel', { task_id: positionals[0], signal: flags.signal }) });
     return;
   }
   if (cmd === 'capabilities') { json({ ok: true, result: await remoteCall(config, 'capabilities', {}) }); return; }
@@ -129,6 +156,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  json({ ok: false, error: error instanceof Error ? error.message : String(error) });
+  json({ ok: false, error: { code: error?.code || 'CLIENT_ERROR', message: error instanceof Error ? error.message : String(error), ...(error?.data !== undefined ? { data: error.data } : {}) } });
   process.exitCode = 1;
 });

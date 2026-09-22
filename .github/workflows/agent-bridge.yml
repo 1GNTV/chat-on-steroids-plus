@@ -2,7 +2,7 @@ name: Agent Bridge
 
 on:
   push:
-    branches: [main, remote-one-command]
+    branches: [main, mcp-like-v3]
     paths:
       - "agent-bridge/**"
       - "remote-client/**"
@@ -46,3 +46,4 @@ jobs:
         run: |
           npm install --global https://github.com/1GNTV/chat-on-steroids-plus/archive/refs/heads/cos-plus-client.tar.gz
           cos-plus --help
+
