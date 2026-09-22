@@ -1,6 +1,5 @@
 import fs from 'node:fs';
 import net from 'node:net';
-import path from 'node:path';
 import { spawn } from 'node:child_process';
 import {
   MAX_MESSAGE_BYTES,
@@ -19,7 +18,6 @@ const rootArg = process.argv[2] ?? process.cwd();
 const root = canonicalRoot(rootArg);
 const token = process.env.AGENT_BRIDGE_TOKEN || randomToken();
 const processes = new Map();
-const IS_WINDOWS = process.platform === 'win32';
 let nextSession = 1;
 let shuttingDown = false;
 
@@ -35,7 +33,6 @@ function appendBuffer(record, chunk, stream) {
 }
 
 function snapshot(record, from = 0) {
-  const output = record.output.slice(from);
   return {
     session_id: record.id,
     running: record.running,
@@ -43,7 +40,7 @@ function snapshot(record, from = 0) {
     signal: record.signal,
     pid: record.child.pid,
     cwd: relativeDisplay(root, record.cwd),
-    output,
+    output: record.output.slice(from),
     next_cursor: record.output.length,
     truncated: record.truncated
   };
@@ -51,47 +48,36 @@ function snapshot(record, from = 0) {
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
-function waitForExit(record, timeoutMs = 1500) {
-  if (!record.running) return Promise.resolve();
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve();
-    };
-    const timer = setTimeout(finish, timeoutMs);
-    timer.unref?.();
-    record.child.once('close', finish);
-  });
+async function waitForActivity(record, cursor, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (record.output.length > cursor || !record.running) return;
+    await sleep(Math.min(20, Math.max(1, deadline - Date.now())));
+  }
 }
 
-async function terminateRecord(record, signal = 'SIGTERM') {
-  if (!record.running) return;
+function waitForExit(record, timeoutMs = 1500) {
+  if (!record.running) return Promise.resolve();
+  return Promise.race([
+    new Promise((resolve) => record.child.once('close', resolve)),
+    sleep(timeoutMs)
+  ]);
+}
 
-  if (IS_WINDOWS && record.child.pid) {
+async function terminate(record, signal = 'SIGTERM') {
+  if (!record.running) return;
+  if (process.platform === 'win32' && record.child.pid) {
     await new Promise((resolve) => {
-      let settled = false;
-      const finish = () => {
-        if (settled) return;
-        settled = true;
-        resolve();
-      };
-      const killer = spawn('taskkill', ['/PID', String(record.child.pid), '/T', '/F'], {
+      const killer = spawn('taskkill', ['/pid', String(record.child.pid), '/T', '/F'], {
         windowsHide: true,
         stdio: 'ignore'
       });
-      killer.once('close', finish);
-      killer.once('error', () => {
-        try { record.child.kill(signal); } catch {}
-        finish();
-      });
+      killer.once('error', () => { try { record.child.kill(signal); } catch {} resolve(); });
+      killer.once('close', resolve);
     });
   } else {
     try { record.child.kill(signal); } catch {}
   }
-
   await waitForExit(record);
 }
 
@@ -100,6 +86,7 @@ async function execOp(args = {}) {
   if (!command) throw new Error('command is required');
   const cwd = resolveWithin(root, args.cwd ?? '.');
   if (!fs.statSync(cwd).isDirectory()) throw new Error('cwd must be a directory');
+
   const id = nextSession++;
   const child = spawn(command, {
     cwd,
@@ -113,9 +100,14 @@ async function execOp(args = {}) {
   child.stdout.on('data', (d) => appendBuffer(record, d, 'stdout'));
   child.stderr.on('data', (d) => appendBuffer(record, d, 'stderr'));
   child.on('error', (error) => appendBuffer(record, Buffer.from(`\n[spawn error] ${error.message}\n`), 'stderr'));
-  child.on('close', (code, signal) => { record.running = false; record.exitCode = code; record.signal = signal; });
+  child.on('close', (code, signal) => {
+    record.running = false;
+    record.exitCode = code;
+    record.signal = signal;
+  });
+
   const yieldMs = Math.max(0, Math.min(30_000, Number(args.yield_ms ?? 1000)));
-  if (yieldMs) await sleep(yieldMs);
+  if (yieldMs) await waitForActivity(record, 0, yieldMs);
   return snapshot(record, 0);
 }
 
@@ -124,12 +116,14 @@ async function writeStdinOp(args = {}) {
   const record = processes.get(id);
   if (!record) throw new Error(`Unknown session_id: ${args.session_id}`);
   const cursor = Math.max(0, Math.min(record.output.length, Number(args.cursor ?? 0)));
+
   if (args.chars !== undefined) {
     if (!record.running) throw new Error('Process has already exited');
     record.child.stdin.write(String(args.chars));
   }
+
   const yieldMs = Math.max(0, Math.min(30_000, Number(args.yield_ms ?? 250)));
-  if (yieldMs) await sleep(yieldMs);
+  if (yieldMs) await waitForActivity(record, cursor, yieldMs);
   return snapshot(record, cursor);
 }
 
@@ -137,8 +131,17 @@ async function killOp(args = {}) {
   const id = Number(args.session_id);
   const record = processes.get(id);
   if (!record) throw new Error(`Unknown session_id: ${args.session_id}`);
-  await terminateRecord(record, args.signal || 'SIGTERM');
+  await terminate(record, args.signal || 'SIGTERM');
   return { session_id: id, signalled: true, running: record.running };
+}
+
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  await Promise.all([...processes.values()].map((record) => terminate(record).catch(() => {})));
+  removeState();
+  await new Promise((resolve) => server.close(resolve));
+  process.exit(0);
 }
 
 async function dispatch(req) {
@@ -156,11 +159,9 @@ async function dispatch(req) {
     case 'write_stdin': return writeStdinOp(req.args);
     case 'kill': return killOp(req.args);
     case 'processes': return [...processes.values()].map((r) => snapshot(r, r.output.length));
-    case 'shutdown': {
-      const timer = setTimeout(() => { void gracefulShutdown(); }, 25);
-      timer.unref?.();
+    case 'shutdown':
+      setTimeout(() => { void shutdown(); }, 25);
       return { shutting_down: true };
-    }
     default: throw new Error(`Unknown action: ${req.action}`);
   }
 }
@@ -195,15 +196,6 @@ server.listen(0, '127.0.0.1', () => {
   writeState({ version: VERSION, pid: process.pid, port: address.port, token, root, started_at: new Date().toISOString() });
 });
 
-async function gracefulShutdown() {
-  if (shuttingDown) return;
-  shuttingDown = true;
-  await Promise.all([...processes.values()].filter((record) => record.running).map((record) => terminateRecord(record)));
-  removeState();
-  await new Promise((resolve) => server.close(resolve));
-  process.exit(0);
-}
-
-process.on('SIGINT', () => { void gracefulShutdown(); });
-process.on('SIGTERM', () => { void gracefulShutdown(); });
+process.on('SIGINT', () => { void shutdown(); });
+process.on('SIGTERM', () => { void shutdown(); });
 process.on('exit', removeState);
