@@ -1,0 +1,24 @@
+{
+  "name": "chat-on-steroids-plus-bridge",
+  "version": "0.1.0",
+  "description": "Local CLI bridge for ChatGPT coding workflows: read, search, patch and persistent shell sessions without an MCP transport.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "agent-bridge": "./bin/agent-bridge.mjs",
+    "cos-plus": "./bin/agent-bridge.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "smoke": "node ./bin/agent-bridge.mjs --help"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
