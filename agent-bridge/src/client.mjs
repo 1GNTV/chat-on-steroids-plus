@@ -81,6 +81,11 @@ export async function stopDaemon() {
   if (!state) return { stopped: false, reason: 'not_running' };
   if (!(await ping(state))) { removeState(); return { stopped: false, reason: 'stale_state' }; }
   const res = await requestRaw(state, { action: 'shutdown', args: {} }, 1500);
+  for (let i = 0; i < 40; i++) {
+    if (!(await ping(state))) break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  if (await ping(state)) throw new Error('Daemon did not stop cleanly');
   removeState();
   return { stopped: true, result: res.result };
 }

@@ -19,7 +19,7 @@ before(async () => {
 });
 after(async () => {
   await stopDaemon().catch(() => {});
-  fs.rmSync(root, { recursive: true, force: true });
+  fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 test('read returns bounded numbered lines', async () => {

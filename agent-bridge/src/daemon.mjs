@@ -19,7 +19,9 @@ const rootArg = process.argv[2] ?? process.cwd();
 const root = canonicalRoot(rootArg);
 const token = process.env.AGENT_BRIDGE_TOKEN || randomToken();
 const processes = new Map();
+const IS_WINDOWS = process.platform === 'win32';
 let nextSession = 1;
+let shuttingDown = false;
 
 function appendBuffer(record, chunk, stream) {
   const text = chunk.toString();
@@ -48,6 +50,50 @@ function snapshot(record, from = 0) {
 }
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+function waitForExit(record, timeoutMs = 1500) {
+  if (!record.running) return Promise.resolve();
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    timer.unref?.();
+    record.child.once('close', finish);
+  });
+}
+
+async function terminateRecord(record, signal = 'SIGTERM') {
+  if (!record.running) return;
+
+  if (IS_WINDOWS && record.child.pid) {
+    await new Promise((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      const killer = spawn('taskkill', ['/PID', String(record.child.pid), '/T', '/F'], {
+        windowsHide: true,
+        stdio: 'ignore'
+      });
+      killer.once('close', finish);
+      killer.once('error', () => {
+        try { record.child.kill(signal); } catch {}
+        finish();
+      });
+    });
+  } else {
+    try { record.child.kill(signal); } catch {}
+  }
+
+  await waitForExit(record);
+}
 
 async function execOp(args = {}) {
   const command = String(args.command ?? '');
@@ -91,8 +137,8 @@ async function killOp(args = {}) {
   const id = Number(args.session_id);
   const record = processes.get(id);
   if (!record) throw new Error(`Unknown session_id: ${args.session_id}`);
-  if (record.running) record.child.kill(args.signal || 'SIGTERM');
-  return { session_id: id, signalled: true };
+  await terminateRecord(record, args.signal || 'SIGTERM');
+  return { session_id: id, signalled: true, running: record.running };
 }
 
 async function dispatch(req) {
@@ -110,7 +156,11 @@ async function dispatch(req) {
     case 'write_stdin': return writeStdinOp(req.args);
     case 'kill': return killOp(req.args);
     case 'processes': return [...processes.values()].map((r) => snapshot(r, r.output.length));
-    case 'shutdown': setTimeout(() => process.exit(0), 50); return { shutting_down: true };
+    case 'shutdown': {
+      const timer = setTimeout(() => { void gracefulShutdown(); }, 25);
+      timer.unref?.();
+      return { shutting_down: true };
+    }
     default: throw new Error(`Unknown action: ${req.action}`);
   }
 }
@@ -145,12 +195,15 @@ server.listen(0, '127.0.0.1', () => {
   writeState({ version: VERSION, pid: process.pid, port: address.port, token, root, started_at: new Date().toISOString() });
 });
 
-function shutdown() {
-  for (const record of processes.values()) if (record.running) record.child.kill('SIGTERM');
+async function gracefulShutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  await Promise.all([...processes.values()].filter((record) => record.running).map((record) => terminateRecord(record)));
   removeState();
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(0), 500).unref();
+  await new Promise((resolve) => server.close(resolve));
+  process.exit(0);
 }
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
+
+process.on('SIGINT', () => { void gracefulShutdown(); });
+process.on('SIGTERM', () => { void gracefulShutdown(); });
 process.on('exit', removeState);
