@@ -82,7 +82,13 @@ export async function ensureDaemon(root = null) {
 export async function call(action, args = {}, options = {}) {
   const state = options.state ?? await ensureDaemon(options.root ?? null);
   const res = await requestRaw(state, { action, args });
-  if (!res.ok) throw new Error(res.error || 'Unknown daemon error');
+  if (!res.ok) {
+    const remote = res.error;
+    const error = new Error(typeof remote === 'string' ? remote : remote?.message || 'Unknown daemon error');
+    if (remote?.code) error.code = remote.code;
+    if (remote?.data !== undefined) error.data = remote.data;
+    throw error;
+  }
   return res.result;
 }
 

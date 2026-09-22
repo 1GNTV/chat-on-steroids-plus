@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-export const VERSION = '0.2.0';
+export const VERSION = '0.3.0';
 export const MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
 export const MAX_READ_BYTES = 512 * 1024;
 export const MAX_PROCESS_BUFFER = 2 * 1024 * 1024;
